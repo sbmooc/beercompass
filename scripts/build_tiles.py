@@ -7,12 +7,19 @@ Uses only the standard library so the GitHub Action needs no installs.
 import json
 import math
 import sys
+import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+# The public Overpass servers are often overloaded, so try a few in turn.
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+ROUNDS = 3
 QUERY = """
 [out:json][timeout:600];
 area["ISO3166-1"="GB"][admin_level=2]->.uk;
@@ -21,15 +28,35 @@ out center tags qt;
 """
 
 
-def fetch_pubs():
+def query_overpass(url):
     body = urllib.parse.urlencode({"data": QUERY}).encode()
     request = urllib.request.Request(
-        OVERPASS_URL,
+        url,
         data=body,
         headers={"User-Agent": "beercompass (github.com/sbmooc/beercompass)"},
     )
     with urllib.request.urlopen(request, timeout=900) as response:
-        elements = json.load(response)["elements"]
+        result = json.load(response)
+    # Overpass reports timeouts and memory errors as a "remark" alongside partial data.
+    if "remark" in result:
+        raise RuntimeError(result["remark"])
+    return result["elements"]
+
+
+def fetch_elements():
+    for attempt in range(ROUNDS):
+        for url in OVERPASS_URLS:
+            try:
+                return query_overpass(url)
+            except Exception as error:
+                print(f"{url} failed: {error}", file=sys.stderr)
+        if attempt < ROUNDS - 1:
+            time.sleep(60 * (attempt + 1))
+    sys.exit("All Overpass servers failed")
+
+
+def fetch_pubs():
+    elements = fetch_elements()
 
     pubs = []
     for element in elements:
