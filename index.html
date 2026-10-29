@@ -1,35 +1,210 @@
 <!doctype html>
 <html lang="en">
-    <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Bootstrap demo</title>
-    
-    
-    </head>
-    <body>
-    <div id="demo">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1a1209">
+  <title>Beer Compass</title>
+  <style>
+    :root {
+      --bg: #1a1209;
+      --fg: #f5e9d4;
+      --muted: #a8977c;
+      --accent: #f2a900;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 2rem;
+      padding: 1rem;
+      text-align: center;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+    #compass {
+      width: min(70vw, 50vh);
+      aspect-ratio: 1;
+      border: 3px solid var(--muted);
+      border-radius: 50%;
+      position: relative;
+    }
+    #arrow {
+      position: absolute;
+      inset: 8%;
+      transition: transform 0.2s linear;
+    }
+    #name { font-size: 1.6rem; font-weight: 600; margin: 0; }
+    #distance { font-size: 3rem; font-weight: 700; color: var(--accent); margin: 0; font-variant-numeric: tabular-nums; }
+    #status { color: var(--muted); margin: 0; min-height: 1.2em; }
+    button {
+      font: inherit;
+      font-size: 1.3rem;
+      padding: 1rem 2rem;
+      border: 0;
+      border-radius: 999px;
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 700;
+    }
+    footer { position: fixed; bottom: 0.5rem; font-size: 0.75rem; color: var(--muted); }
+    footer a { color: inherit; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <button id="start">🍺 Find beer</button>
+
+  <main id="app" hidden>
+    <div id="compass">
+      <svg id="arrow" viewBox="0 0 100 100" aria-hidden="true">
+        <polygon points="50,2 72,62 50,52 28,62" fill="var(--accent)" />
+        <polygon points="50,52 72,62 50,98 28,62" fill="var(--muted)" opacity="0.4" />
+      </svg>
     </div>
-    
-    
-    </body>
- <script>
-const x = document.getElementById("demo");
+    <p id="name"></p>
+    <p id="distance"></p>
+  </main>
+  <p id="status"></p>
 
-function getLocation() {
-  if (navigator.geolocation) {
-    navigator.geolocation.watchPosition(showPosition);
-  } else {
-    x.innerHTML = "Geolocation is not supported by this browser.";
+  <footer>Pub data © <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+const tiles = new Map(); // "lat_lon" -> Promise<[[lat, lon, name], ...]>
+let position = null;     // {lat, lon}
+let nearest = null;      // {lat, lon, name, distance}
+let heading = null;      // degrees clockwise from north
+let arrowAngle = 0;      // unwrapped, so the arrow never spins the long way round
+
+function loadTile(key) {
+  if (!tiles.has(key)) {
+    tiles.set(key, fetch(`data/${key}.json`).then((r) => (r.ok ? r.json() : [])).catch(() => []));
   }
+  return tiles.get(key);
 }
 
-function showPosition(position) {
-  x.innerHTML = "Latitude: " + position.coords.latitude +
-  "<br>Longitude: " + position.coords.longitude +
-  "<br>Heading: " + position.coords.heading ;
+// Tiles overlapping a box of +/- `pad` degrees around the user.
+function tileKeysAround(lat, lon, pad) {
+  const keys = new Set();
+  for (let y = Math.floor(lat - pad); y <= Math.floor(lat + pad); y++) {
+    for (let x = Math.floor(lon - pad * 1.6); x <= Math.floor(lon + pad * 1.6); x++) {
+      keys.add(`${y}_${x}`);
+    }
+  }
+  return [...keys];
 }
 
-getLocation()
-</script> 
+const rad = (d) => (d * Math.PI) / 180;
+
+function distance(lat1, lon1, lat2, lon2) {
+  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2 +
+    Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lon2 - lon1) / 2) ** 2;
+  return 6371000 * 2 * Math.asin(Math.sqrt(a));
+}
+
+function bearing(lat1, lon1, lat2, lon2) {
+  const y = Math.sin(rad(lon2 - lon1)) * Math.cos(rad(lat2));
+  const x = Math.cos(rad(lat1)) * Math.sin(rad(lat2)) -
+    Math.sin(rad(lat1)) * Math.cos(rad(lat2)) * Math.cos(rad(lon2 - lon1));
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+async function findNearest(lat, lon) {
+  // Usually one tile covers the ~10km around you; widen the search in sparse areas.
+  for (const pad of [0.1, 1]) {
+    const pubs = (await Promise.all(tileKeysAround(lat, lon, pad).map(loadTile))).flat();
+    let best = null;
+    for (const [pLat, pLon, name] of pubs) {
+      const d = distance(lat, lon, pLat, pLon);
+      if (!best || d < best.distance) best = { lat: pLat, lon: pLon, name, distance: d };
+    }
+    // Only trust the result if it's closer than the edge of the area we searched.
+    if (best && best.distance < pad * 111000 * 0.9) return best;
+    if (best && pad === 1) return best;
+  }
+  return null;
+}
+
+function render() {
+  if (!position) return;
+  if (!nearest) {
+    $("status").textContent = "No pubs found nearby 😢";
+    return;
+  }
+  $("app").hidden = false;
+  $("name").textContent = nearest.name || "Unnamed pub";
+  const d = distance(position.lat, position.lon, nearest.lat, nearest.lon);
+  $("distance").textContent = d < 10000 ? `${Math.round(d)} m` : `${(d / 1000).toFixed(1)} km`;
+
+  if (heading === null) {
+    $("status").textContent = "Waiting for compass…";
+    return;
+  }
+  $("status").textContent = "";
+  const target = bearing(position.lat, position.lon, nearest.lat, nearest.lon) - heading;
+  arrowAngle += ((((target - arrowAngle) % 360) + 540) % 360) - 180;
+  $("arrow").style.transform = `rotate(${arrowAngle}deg)`;
+}
+
+async function onPosition(pos) {
+  position = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+  nearest = await findNearest(position.lat, position.lon);
+  render();
+}
+
+function screenAngle() {
+  return (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+}
+
+function onOrientation(e) {
+  if (typeof e.webkitCompassHeading === "number") {
+    heading = e.webkitCompassHeading; // iOS: already clockwise from north
+  } else if (e.absolute && e.alpha !== null) {
+    heading = 360 - e.alpha; // alpha is counter-clockwise
+  } else {
+    return;
+  }
+  heading = (heading + screenAngle()) % 360;
+  render();
+}
+
+$("start").addEventListener("click", async () => {
+  $("start").hidden = true;
+  $("status").textContent = "Finding you…";
+
+  // iOS only grants compass access from inside a user gesture.
+  if (typeof DeviceOrientationEvent !== "undefined" &&
+      typeof DeviceOrientationEvent.requestPermission === "function") {
+    try {
+      if ((await DeviceOrientationEvent.requestPermission()) !== "granted") {
+        $("status").textContent = "Compass permission denied — distance only.";
+      }
+    } catch (err) {
+      $("status").textContent = "Couldn't access the compass.";
+    }
+  }
+  if ("ondeviceorientationabsolute" in window) {
+    window.addEventListener("deviceorientationabsolute", onOrientation);
+  } else {
+    window.addEventListener("deviceorientation", onOrientation);
+  }
+
+  if (!navigator.geolocation) {
+    $("status").textContent = "Geolocation isn't supported on this device.";
+    return;
+  }
+  navigator.geolocation.watchPosition(onPosition, (err) => {
+    $("status").textContent = `Couldn't get your location: ${err.message}`;
+  }, { enableHighAccuracy: true, maximumAge: 5000 });
+});
+</script>
+</body>
 </html>
